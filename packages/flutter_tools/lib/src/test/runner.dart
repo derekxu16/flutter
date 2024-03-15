@@ -325,6 +325,7 @@ class _FlutterTestRunnerImpl implements FlutterTestRunner {
 
     final StringBuffer buffer = StringBuffer();
     buffer.writeln('''
+import 'dart:async';
 import 'dart:ffi';
 import 'dart:isolate';
 import 'dart:ui';
@@ -332,6 +333,7 @@ import 'dart:ui';
 import 'package:ffi/ffi.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:stream_channel/isolate_channel.dart';
+import 'package:stream_channel/stream_channel.dart';
 import 'package:test_api/backend.dart'; // flutter_ignore: test_api_import
 ''');
 
@@ -340,6 +342,7 @@ import 'package:test_api/backend.dart'; // flutter_ignore: test_api_import
       return path
           .replaceAll('.', '_')
           .replaceAll(':', '_')
+          .replaceAll('-', '_')
           .replaceAll('/', '_')
           .replaceAll(r'\', '_')
           .replaceRange(path.length - '.dart'.length, null, '');
@@ -390,27 +393,59 @@ import 'package:test_api/backend.dart'; // flutter_ignore: test_api_import
 @Native<Void Function(Pointer<Utf8>, Pointer<Utf8>)>(symbol: 'Spawn')
 external void _spawn(Pointer<Utf8> entrypoint, Pointer<Utf8> route);
 
-void spawn({required SendPort port, String entrypoint = 'main', String route = '/'}) {
+void spawn({
+  required SendPort portForPackageTestCommunication,
+  required SendPort portForShutdownNotification,
+  String entrypoint = 'main',
+  String route = '/',
+}) {
   assert(
     entrypoint != 'main' || route != '/',
     'Spawn should not be used to spawn main with the default route name',
   );
-  IsolateNameServer.registerPortWithName(port, route);
+  IsolateNameServer.registerPortWithName(
+    portForPackageTestCommunication,
+    '${route}_for_package_test_communication',
+  );
+  IsolateNameServer.registerPortWithName(
+    portForShutdownNotification,
+    '${route}_for_shutdown_notification',
+  );
   _spawn(entrypoint.toNativeUtf8(), route.toNativeUtf8());
 }
 ''');
 
-  buffer.write('''
+  buffer.writeln('''
 /// Runs on a spawned isolate.
 void createChannelAndConnect(String path, String name, Function testMain) {
   goldenFileComparator = LocalFileComparator(Uri.parse(path));
   autoUpdateGoldenFiles = $autoUpdateGoldenFiles;
-  final IsolateChannel<dynamic> channel = IsolateChannel<dynamic>.connectSend(
-    IsolateNameServer.lookupPortByName(name)!,
+''');
+
+  buffer.write(r'''
+  final IsolateChannel<dynamic> channelForPackageTestCommunication = IsolateChannel<dynamic>.connectSend(
+    IsolateNameServer.lookupPortByName('${name}_for_package_test_communication')!,
   );
-  channel.pipe(RemoteListener.start(() => testMain));
+  final IsolateChannel<dynamic> channelForShutdownNotification = IsolateChannel<dynamic>.connectSend(
+    IsolateNameServer.lookupPortByName('${name}_for_shutdown_notification')!,
+  );
+
+  final StreamChannel<Object?> remoteListenerChannel = RemoteListener.start(() => testMain);
+  remoteListenerChannel.stream.pipe(channelForPackageTestCommunication.sink);
+
+  final StreamSubscription<dynamic> channelForPackageTestCommunicationSubscription = channelForPackageTestCommunication.stream.listen(
+    remoteListenerChannel.sink.add,
+  );
+
+  channelForShutdownNotification.stream.listen(null, onDone: () async {
+    await channelForPackageTestCommunicationSubscription.cancel();
+    await remoteListenerChannel.sink.close();
+    await channelForPackageTestCommunication.sink.close();
+    await channelForShutdownNotification.sink.close();
+  });
 }
 
+@pragma('vm:entry-point')
 void testMain() {
   final String route = PlatformDispatcher.instance.defaultRouteName;
   switch (route) {
@@ -438,8 +473,19 @@ void main([dynamic sendPort]) {
     final ReceivePort receivePort = ReceivePort();
     receivePort.listen((dynamic msg) {
       switch (msg as List<dynamic>) {
-        case ['spawn', final SendPort port, final String entrypoint, final String route]:
-          spawn(port: port, entrypoint: entrypoint, route: route);
+        case [
+          'spawn',
+          final SendPort portForPackageTestCommunication,
+          final SendPort portForShutdownNotification,
+          final String entrypoint,
+          final String route
+        ]:
+          spawn(
+            portForPackageTestCommunication: portForPackageTestCommunication,
+            portForShutdownNotification: portForShutdownNotification,
+            entrypoint: entrypoint,
+            route: route,
+          );
         case ['close']:
           receivePort.close();
       }
@@ -499,7 +545,8 @@ bool readyToRun = false;
 final Completer<void> readyToRunSignal = Completer<void>();
 
 Future<void> spawn({
-  required SendPort port,
+  required SendPort portForPackageTestCommunication,
+  required SendPort portForShutdownNotification,
   String entrypoint = 'main',
   String route = '/',
 }) async {
@@ -507,7 +554,13 @@ Future<void> spawn({
     await readyToRunSignal.future;
   }
 
-  commandPort.send(<Object>['spawn', port, entrypoint, route]);
+  commandPort.send(<Object>[
+    'spawn',
+    portForPackageTestCommunication,
+    portForShutdownNotification,
+    entrypoint,
+    route,
+  ]);
 }
 
 void main() async {
@@ -555,6 +608,7 @@ String pathToImport(String path) {
       .replaceRange(path.length - '.dart'.length, null, '')
       .replaceAll('.', '_')
       .replaceAll(':', '_')
+      .replaceAll('-', '_')
       .replaceAll('/', '_')
       .replaceAll(r'\', '_');
 }
@@ -562,13 +616,32 @@ String pathToImport(String path) {
 class SpawnPlugin extends PlatformPlugin {
   SpawnPlugin();
 
-  final Map<String, IsolateChannel<dynamic>> _channels = <String, IsolateChannel<dynamic>>{};
+  final Map<String, StreamChannel<dynamic>> _channels = <String, StreamChannel<dynamic>>{};
 
   Future<void> launchIsolate(String path) async {
+    final ReceivePort portForShutdownNotification = ReceivePort();
+    final IsolateChannel<dynamic> channelForShutdownNotification = IsolateChannel<dynamic>.connectReceive(
+      portForShutdownNotification,
+    );
+
     final String name = pathToImport(path);
-    final ReceivePort port = ReceivePort();
-    _channels[name] = IsolateChannel<dynamic>.connectReceive(port);
-    await spawn(port: port.sendPort, route: name);
+    final ReceivePort portForPackageTestCommunication = ReceivePort();
+    late final StreamChannel<dynamic> channelForPackageTestCommunication;
+    channelForPackageTestCommunication = IsolateChannel<dynamic>.connectReceive(portForPackageTestCommunication).transformStream(
+      StreamTransformer<dynamic, dynamic>.fromHandlers(
+        handleDone: (EventSink<dynamic> sink) async {
+          await channelForShutdownNotification.sink.close();
+          sink.close();
+        },
+      ),
+    );
+    _channels[name] = channelForPackageTestCommunication;
+
+    await spawn(
+      portForPackageTestCommunication: portForPackageTestCommunication.sendPort,
+      portForShutdownNotification: portForShutdownNotification.sendPort,
+      route: name,
+    );
   }
 
   @override

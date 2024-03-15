@@ -424,13 +424,6 @@ class TestCommand extends FlutterCommand with DeviceBasedDevelopmentArtifacts {
       // Running with concurrency will result in deploying multiple test apps
       // on the connected device concurrently, which is not supported.
       jobs = 1;
-    } else if (experimentalFasterTesting) {
-      if (argResults!.wasParsed('concurrency')) {
-        globals.printStatus(
-          '-j/--concurrency was parsed but will be ignored. This option is not '
-          'compatible with --experimental-faster-testing.',
-        );
-      }
     }
 
     final int? shardIndex = int.tryParse(stringArg('shard-index') ?? '');
